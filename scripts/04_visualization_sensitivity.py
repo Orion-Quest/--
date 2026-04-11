@@ -129,36 +129,68 @@ print("绘制 CLPM 系数对比图...")
 
 clpm_cross = clpm_df[clpm_df['效应类型'] == '交叉效应(Partner)'].copy()
 
-fig, ax = plt.subplots(figsize=(10, 5))
-# 按因变量分组
-vars_order = ['丈夫身体共病(t+1)', '妻子身体共病(t+1)',
-              '丈夫CESD(t+1)', '妻子CESD(t+1)',
-              '丈夫多维共病(t+1)', '妻子多维共病(t+1)']
-clpm_cross = clpm_cross[clpm_cross['因变量'].isin(vars_order)]
-clpm_cross['因变量'] = pd.Categorical(clpm_cross['因变量'], categories=vars_order, ordered=True)
-clpm_cross = clpm_cross.sort_values('因变量')
+# 若筛选为空，尝试匹配新格式的效应类型名
+if len(clpm_cross) == 0:
+    clpm_cross = clpm_df[clpm_df['效应类型'].str.contains('交叉|Partner|Cross', case=False, na=False)].copy()
 
-y_pos = range(len(clpm_cross))
-beta_vals = clpm_cross['β'].apply(lambda x: float(x))
-colors = ['#2196F3' if '丈夫' in v else '#E91E63' for v in clpm_cross['因变量']]
+if len(clpm_cross) > 0:
+    fig, ax = plt.subplots(figsize=(10, 6))
 
-ax.barh(list(y_pos), beta_vals, color=colors, alpha=0.8, height=0.6)
-ax.axvline(x=0, color='black', linestyle='--', linewidth=0.8)
+    # 按β值排序展示
+    clpm_cross['β_float'] = clpm_cross['β'].apply(lambda x: float(x))
+    clpm_cross = clpm_cross.sort_values('β_float')
 
-# 添加数值标签
-for i, (v, sig) in enumerate(zip(beta_vals, clpm_cross['显著性'])):
-    ax.text(v + 0.002, i, f'{v:.4f}{sig}', va='center', fontsize=10)
+    y_pos = range(len(clpm_cross))
+    beta_vals = clpm_cross['β_float']
 
-ax.set_yticks(list(y_pos))
-ax.set_yticklabels(clpm_cross['因变量'], fontsize=11)
-ax.set_xlabel('交叉滞后系数 β (Partner效应)', fontsize=12)
-ax.set_title('CLPM: 配偶共病溢出效应系数对比', fontsize=14)
-ax.grid(True, alpha=0.3, axis='x')
+    # 根据因变量名着色：身体=蓝，CESD/抑郁=橙，多维=紫
+    def get_color(name):
+        name = str(name)
+        if '身体' in name or 'phys' in name.lower():
+            return '#2196F3'
+        elif 'CESD' in name or '抑郁' in name or 'cesd' in name.lower():
+            return '#FF9800'
+        else:
+            return '#9C27B0'
 
-plt.tight_layout()
-plt.savefig(os.path.join(FIG_DIR, "fig12_clpm_comparison.png"), dpi=300, bbox_inches='tight')
-plt.close()
-print("已保存: fig12_clpm_comparison.png")
+    colors = [get_color(v) for v in clpm_cross['因变量']]
+
+    bars = ax.barh(list(y_pos), beta_vals, color=colors, alpha=0.85, height=0.55)
+    ax.axvline(x=0, color='black', linestyle='--', linewidth=0.8)
+
+    # 添加数值标签
+    for i, (v, sig) in enumerate(zip(beta_vals, clpm_cross['显著性'])):
+        offset = max(abs(v) * 0.1, 0.002)
+        ax.text(v + offset, i, f'{v:.4f}{sig}', va='center', fontsize=10, fontweight='bold')
+
+    # Y轴标签：简化因变量名
+    ylabels = []
+    for name in clpm_cross['因变量']:
+        name = str(name)
+        name = name.replace('(t+1)', '').replace('（t+1）', '').strip()
+        ylabels.append(name)
+
+    ax.set_yticks(list(y_pos))
+    ax.set_yticklabels(ylabels, fontsize=11)
+    ax.set_xlabel('交叉滞后系数 β（伙伴效应）', fontsize=12)
+    ax.set_title('CLPM：配偶共病溢出效应系数对比', fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3, axis='x')
+
+    # 图例
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='#2196F3', alpha=0.85, label='身体共病'),
+        Patch(facecolor='#FF9800', alpha=0.85, label='抑郁得分'),
+        Patch(facecolor='#9C27B0', alpha=0.85, label='多维共病'),
+    ]
+    ax.legend(handles=legend_elements, fontsize=10, loc='lower right')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(FIG_DIR, "fig12_clpm_comparison.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+    print("已保存: fig12_clpm_comparison.png")
+else:
+    print("警告: 未找到交叉效应数据，跳过图12")
 
 # ============================================================
 # 3. 夫妻轨迹组合与健康结局热力图
@@ -467,29 +499,31 @@ ax.grid(True, alpha=0.3)
 
 # 6c. CLPM Partner效应对比 (左下)
 ax = axes[1, 0]
-clpm_cross_sorted = clpm_cross.copy()
-beta_vals = clpm_cross_sorted['β'].apply(lambda x: float(x))
-y_pos = range(len(clpm_cross_sorted))
-colors = ['#2196F3' if '丈夫' in v else '#E91E63' for v in clpm_cross_sorted['因变量']]
-bars = ax.barh(list(y_pos), beta_vals, color=colors, alpha=0.8, height=0.5)
-for i, (v, sig) in enumerate(zip(beta_vals, clpm_cross_sorted['显著性'])):
-    ax.text(v + 0.001, i, f'{v:.4f}{sig}', va='center', fontsize=9)
-ax.set_yticks(list(y_pos))
-short_labels = [v.replace('(t+1)', '') for v in clpm_cross_sorted['因变量']]
-ax.set_yticklabels(short_labels, fontsize=10)
-ax.set_xlabel('Partner效应 β', fontsize=11)
+if len(clpm_cross) > 0:
+    clpm_c = clpm_cross.copy()
+    beta_c = clpm_c['β_float'] if 'β_float' in clpm_c.columns else clpm_c['β'].apply(lambda x: float(x))
+    y_pos_c = range(len(clpm_c))
+    colors_c = [get_color(v) for v in clpm_c['因变量']]
+    ax.barh(list(y_pos_c), beta_c, color=colors_c, alpha=0.85, height=0.5)
+    for i, (v, sig) in enumerate(zip(beta_c, clpm_c['显著性'])):
+        ax.text(v + 0.001, i, f'{v:.4f}{sig}', va='center', fontsize=9)
+    ax.set_yticks(list(y_pos_c))
+    short_labels = [str(v).replace('(t+1)', '').replace('（t+1）', '').strip() for v in clpm_c['因变量']]
+    ax.set_yticklabels(short_labels, fontsize=10)
+ax.set_xlabel('伙伴效应 β', fontsize=11)
 ax.set_title('C. CLPM 配偶溢出效应', fontsize=13, fontweight='bold')
 ax.axvline(x=0, color='black', linestyle='--', linewidth=0.8)
 ax.grid(True, alpha=0.3, axis='x')
 
-# 6d. APIM Actor vs Partner (右下)
+# 6d. APIM 行动者 vs 伙伴 (右下)
 ax = axes[1, 1]
 apim_df = pd.read_csv(os.path.join(TAB_DIR, "table7_apim_results.csv"))
-apim_main = apim_df[apim_df['效应类型'].isin(['Actor效应', 'Partner效应'])].copy()
+apim_main = apim_df[apim_df['效应类型'].isin(['Actor效应', 'Partner效应',
+                                              '行动者效应', '伙伴效应'])].copy()
 apim_main = apim_main[~apim_main['结局变量'].str.contains('交互')].copy()
 
 y_pos = range(len(apim_main))
-colors = ['#2196F3' if 'Actor' in e else '#E91E63' for e in apim_main['效应类型']]
+colors = ['#2196F3' if ('Actor' in e or '行动者' in e) else '#E91E63' for e in apim_main['效应类型']]
 ax.barh(list(y_pos), apim_main['β'], color=colors, alpha=0.8, height=0.5)
 for i, (v, sig) in enumerate(zip(apim_main['β'], apim_main['显著性'])):
     offset = 0.01 if abs(v) < 0.1 else v * 0.05
