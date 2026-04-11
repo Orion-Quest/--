@@ -142,6 +142,7 @@ if len(clpm_cross) > 0:
 
     y_pos = range(len(clpm_cross))
     beta_vals = clpm_cross['β_float']
+    max_abs_beta = float(np.max(np.abs(beta_vals))) if len(beta_vals) > 0 else 0.0
 
     # 根据因变量名着色：身体=蓝，CESD/抑郁=橙，多维=紫
     def get_color(name):
@@ -158,10 +159,22 @@ if len(clpm_cross) > 0:
     bars = ax.barh(list(y_pos), beta_vals, color=colors, alpha=0.85, height=0.55)
     ax.axvline(x=0, color='black', linestyle='--', linewidth=0.8)
 
-    # 添加数值标签
+    # 根据系数范围自动扩展x轴，避免右侧标签被截断
+    x_pad = max(max_abs_beta * 0.18, 0.01)
+    x_left = min(float(np.min(beta_vals)) - x_pad, -0.003)
+    x_right = max(float(np.max(beta_vals)) + x_pad, 0.003)
+    ax.set_xlim(x_left, x_right)
+
+    # 添加数值标签（仅显示系数，显著性统一在图注说明）
     for i, (v, sig) in enumerate(zip(beta_vals, clpm_cross['显著性'])):
-        offset = max(abs(v) * 0.1, 0.002)
-        ax.text(v + offset, i, f'{v:.4f}{sig}', va='center', fontsize=10, fontweight='bold')
+        offset = max(abs(v) * 0.08, 0.002)
+        if v >= 0:
+            x_text = v + offset
+            ha = 'left'
+        else:
+            x_text = v - offset
+            ha = 'right'
+        ax.text(x_text, i, f'{v:.4f}', va='center', ha=ha, fontsize=10, fontweight='bold')
 
     # Y轴标签：简化因变量名
     ylabels = []
@@ -174,7 +187,11 @@ if len(clpm_cross) > 0:
     ax.set_yticklabels(ylabels, fontsize=11)
     ax.set_xlabel('交叉滞后系数 β（伙伴效应）', fontsize=12)
     ax.set_title('CLPM：配偶共病溢出效应系数对比', fontsize=14, fontweight='bold')
+    ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f'{x:.3f}'))
     ax.grid(True, alpha=0.3, axis='x')
+    ax.text(0.0, -0.12, '注: * p<0.05, ** p<0.01, *** p<0.001',
+            transform=ax.transAxes, fontsize=9, color='dimgray',
+            ha='left', va='top', clip_on=False)
 
     # 图例
     from matplotlib.patches import Patch
@@ -185,7 +202,7 @@ if len(clpm_cross) > 0:
     ]
     ax.legend(handles=legend_elements, fontsize=10, loc='lower right')
 
-    plt.tight_layout()
+    plt.tight_layout(rect=(0, 0.06, 1, 1))
     plt.savefig(os.path.join(FIG_DIR, "fig12_clpm_comparison.png"), dpi=300, bbox_inches='tight')
     plt.close()
     print("已保存: fig12_clpm_comparison.png")
