@@ -10,6 +10,7 @@ import statsmodels.api as sm
 from statsmodels.genmod.generalized_estimating_equations import GEE
 from statsmodels.genmod.families import Gaussian, Binomial
 from statsmodels.genmod.cov_struct import Exchangeable, Independence
+from semopy import Model as SEMModel
 import matplotlib
 matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
 matplotlib.rcParams['axes.unicode_minus'] = False
@@ -127,105 +128,210 @@ for dep, indep, label in [
         print(f"\n{label}: 拟合失败 ({e})")
 
 # ============================================================
-# 模型二: 交叉滞后面板模型 (CLPM)
+# 模型二: 交叉滞后面板模型 (CLPM) — 基于SEM
 # ============================================================
 print("\n" + "="*60)
-print("模型二: 交叉滞后面板模型 (CLPM)")
+print("模型二: 交叉滞后面板模型 (CLPM) — SEM实现")
 print("="*60)
 
-# 构建滞后变量
-# 使用完整4波面板
-full_panel = df_long.groupby('householdID').filter(lambda x: len(x) == 4)
+# 构建CLPM所需的宽格式数据 (每行一对夫妻, 列=各波次变量)
+# df_traj 已有 h_phys_w1...h_phys_w4, w_phys_w1...w_phys_w4 等列
+# 同时需要 CESD 和多维共病的宽格式
+clpm_wide = df_traj[['householdID']].copy()
+for var_prefix, long_col in [
+    ('h_phys', 'h_phys_count'), ('w_phys', 'w_phys_count'),
+    ('h_cesd', 'h_cesd10'), ('w_cesd', 'w_cesd10'),
+    ('h_multi', 'h_multi_dim'), ('w_multi', 'w_multi_dim'),
+]:
+    for w in WAVES:
+        wide_col = f'{var_prefix}_w{w}'
+        if wide_col in df_traj.columns:
+            clpm_wide[wide_col] = df_traj[wide_col]
+        else:
+            # 从长格式获取
+            w_data = df_long[df_long['wave'] == w][['householdID', long_col]].drop_duplicates('householdID')
+            w_data = w_data.rename(columns={long_col: wide_col})
+            clpm_wide = clpm_wide.merge(w_data, on='householdID', how='left')
 
-# 为每对夫妻创建 t 和 t+1 的配对
-clpm_rows = []
-for hhid in full_panel['householdID'].unique():
-    couple = full_panel[full_panel['householdID'] == hhid].sort_values('wave')
-    waves_data = couple.set_index('wave')
-    for t, t1 in [(1,2), (2,3), (3,4)]:
-        if t in waves_data.index and t1 in waves_data.index:
-            row = {
-                'householdID': hhid,
-                'wave_t': t, 'wave_t1': t1,
-                # t 期
-                'h_phys_t': waves_data.loc[t, 'h_phys_count'],
-                'w_phys_t': waves_data.loc[t, 'w_phys_count'],
-                'h_cesd_t': waves_data.loc[t, 'h_cesd10'],
-                'w_cesd_t': waves_data.loc[t, 'w_cesd10'],
-                'h_multi_t': waves_data.loc[t, 'h_multi_dim'],
-                'w_multi_t': waves_data.loc[t, 'w_multi_dim'],
-                # t+1 期
-                'h_phys_t1': waves_data.loc[t1, 'h_phys_count'],
-                'w_phys_t1': waves_data.loc[t1, 'w_phys_count'],
-                'h_cesd_t1': waves_data.loc[t1, 'h_cesd10'],
-                'w_cesd_t1': waves_data.loc[t1, 'w_cesd10'],
-                'h_multi_t1': waves_data.loc[t1, 'h_multi_dim'],
-                'w_multi_t1': waves_data.loc[t1, 'w_multi_dim'],
-            }
-            clpm_rows.append(row)
-
-df_clpm = pd.DataFrame(clpm_rows)
-print(f"CLPM数据: {df_clpm.shape[0]} 条 (夫妻×时间段)")
-
-# 2a. 交叉滞后回归 (用GEE处理重复测量)
-print("\n--- 交叉滞后回归 (GEE) ---")
+clpm_data = clpm_wide.dropna()
+print(f"CLPM数据 (完整): {len(clpm_data)} 对夫妻")
 
 clpm_results = []
 
-for outcome, predictors, label in [
-    # 丈夫t+1身体共病 ~ 丈夫t身体共病(自回归) + 妻子t身体共病(交叉效应)
-    ('h_phys_t1', ['h_phys_t', 'w_phys_t'], '丈夫身体共病(t+1)'),
-    ('w_phys_t1', ['w_phys_t', 'h_phys_t'], '妻子身体共病(t+1)'),
-    ('h_cesd_t1', ['h_cesd_t', 'w_cesd_t'], '丈夫CESD(t+1)'),
-    ('w_cesd_t1', ['w_cesd_t', 'h_cesd_t'], '妻子CESD(t+1)'),
-    ('h_multi_t1', ['h_multi_t', 'w_multi_t'], '丈夫多维共病(t+1)'),
-    ('w_multi_t1', ['w_multi_t', 'h_multi_t'], '妻子多维共病(t+1)'),
-]:
-    data = df_clpm[['householdID', outcome] + predictors].dropna()
-    if len(data) < 100:
-        print(f"  {label}: 样本不足，跳过")
-        continue
+def run_sem_clpm(data, h_prefix, w_prefix, label, constrained=True):
+    """
+    用semopy拟合SEM-CLPM模型。
+    constrained=True时约束系数跨时间不变 (时间不变性)。
+    """
+    # 变量名
+    hv = [f'{h_prefix}_w{w}' for w in WAVES]
+    wv = [f'{w_prefix}_w{w}' for w in WAVES]
 
-    y = data[outcome]
-    X = sm.add_constant(data[predictors])
-    groups = data['householdID']
+    # 检查所有变量存在
+    for v in hv + wv:
+        if v not in data.columns:
+            print(f"  {label}: 缺少变量 {v}, 跳过")
+            return []
+
+    subset = data[hv + wv].dropna()
+    if len(subset) < 100:
+        print(f"  {label}: 样本不足 ({len(subset)}), 跳过")
+        return []
+
+    # 构建SEM模型语法
+    lines = []
+    for i in range(len(WAVES) - 1):
+        t, t1 = WAVES[i], WAVES[i+1]
+        h_t, h_t1 = f'{h_prefix}_w{t}', f'{h_prefix}_w{t1}'
+        w_t, w_t1 = f'{w_prefix}_w{t}', f'{w_prefix}_w{t1}'
+
+        if constrained:
+            # 自回归 (约束系数跨时间不变)
+            lines.append(f'{h_t1} ~ a1*{h_t}')
+            lines.append(f'{w_t1} ~ a2*{w_t}')
+            # 交叉滞后 (约束系数跨时间不变)
+            lines.append(f'{h_t1} ~ c1*{w_t}')
+            lines.append(f'{w_t1} ~ c2*{h_t}')
+        else:
+            lines.append(f'{h_t1} ~ {h_t}')
+            lines.append(f'{w_t1} ~ {w_t}')
+            lines.append(f'{h_t1} ~ {w_t}')
+            lines.append(f'{w_t1} ~ {h_t}')
+
+    # 同期残差相关
+    for w in WAVES:
+        lines.append(f'{h_prefix}_w{w} ~~ {w_prefix}_w{w}')
+
+    model_desc = '\n'.join(lines)
 
     try:
-        gee = GEE(y, X, groups=groups, family=Gaussian(),
-                  cov_struct=Exchangeable())
-        result = gee.fit()
+        model = SEMModel(model_desc)
+        result = model.fit(subset)
+        estimates = model.inspect()
 
-        print(f"\n  {label}:")
-        for pred in predictors:
-            coef = result.params[pred]
-            se = result.bse[pred]
-            z = coef / se
-            p = result.pvalues[pred]
-            ci_low = coef - 1.96 * se
-            ci_high = coef + 1.96 * se
+        print(f"\n  --- {label} (SEM-CLPM) ---")
+        results_list = []
 
-            # 判断是自回归还是交叉效应
-            if 'h_' in outcome and 'h_' in pred:
-                effect_type = '自回归(Actor)'
-            elif 'w_' in outcome and 'w_' in pred:
-                effect_type = '自回归(Actor)'
-            else:
-                effect_type = '交叉效应(Partner)'
+        # 提取关键系数
+        for _, row in estimates.iterrows():
+            lval = row['lval']
+            op = row['op']
+            rval = row['rval']
+            est = row['Estimate']
+            se = row.get('Std. Err', np.nan)
+            z = row.get('z-value', np.nan)
+            p = row.get('p-value', np.nan)
 
-            p_str = '<0.0001' if p < 0.0001 else f'{p:.4f}'
-            sig = '***' if p < 0.001 else ('**' if p < 0.01 else ('*' if p < 0.05 else ''))
-            print(f"    {pred} [{effect_type}]: β={coef:.4f} ({ci_low:.4f}, {ci_high:.4f}), "
-                  f"P={p_str}{sig}")
+            if op == '~':
+                # 判断效应类型
+                if h_prefix in lval and h_prefix in rval:
+                    etype = '自回归(Actor-H)'
+                elif w_prefix in lval and w_prefix in rval:
+                    etype = '自回归(Actor-W)'
+                elif h_prefix in lval and w_prefix in rval:
+                    etype = '交叉效应(W→H)'
+                elif w_prefix in lval and h_prefix in rval:
+                    etype = '交叉效应(H→W)'
+                else:
+                    continue
 
-            clpm_results.append({
-                '因变量': label, '自变量': pred,
-                '效应类型': effect_type,
-                'β': f'{coef:.4f}', 'SE': f'{se:.4f}',
-                '95%CI': f'({ci_low:.4f}, {ci_high:.4f})',
-                'P': p_str, '显著性': sig
-            })
+                if np.isnan(p):
+                    p_str = 'NA'
+                    sig = ''
+                else:
+                    p_str = '<0.0001' if p < 0.0001 else f'{p:.4f}'
+                    sig = '***' if p < 0.001 else ('**' if p < 0.01 else ('*' if p < 0.05 else ''))
+
+                ci_low = est - 1.96 * se if not np.isnan(se) else np.nan
+                ci_high = est + 1.96 * se if not np.isnan(se) else np.nan
+
+                print(f"    {rval} → {lval} [{etype}]: β={est:.4f} "
+                      f"(SE={se:.4f}, 95%CI: {ci_low:.4f}~{ci_high:.4f}), P={p_str}{sig}")
+
+                results_list.append({
+                    '因变量': lval, '自变量': rval,
+                    '效应类型': etype,
+                    'β': f'{est:.4f}', 'SE': f'{se:.4f}',
+                    '95%CI': f'({ci_low:.4f}, {ci_high:.4f})',
+                    'P': p_str, '显著性': sig
+                })
+
+        # 模型拟合指标
+        stats_dict = model.calc_stats()
+        if isinstance(stats_dict, pd.DataFrame):
+            print(f"    模型拟合: ", end="")
+            for col in stats_dict.columns:
+                val = stats_dict[col].iloc[0]
+                if isinstance(val, float):
+                    print(f"{col}={val:.3f}  ", end="")
+            print()
+
+        return results_list
+
     except Exception as e:
-        print(f"  {label}: GEE拟合失败 ({e})")
+        print(f"  {label}: SEM拟合失败 ({e})")
+        # 回退到GEE实现
+        print(f"  {label}: 回退到GEE交叉滞后回归...")
+        return run_gee_clpm_fallback(data, h_prefix, w_prefix, label)
+
+
+def run_gee_clpm_fallback(data, h_prefix, w_prefix, label):
+    """GEE回退方案: 当SEM失败时使用"""
+    full_panel = df_long.groupby('householdID').filter(lambda x: len(x) == 4)
+    clpm_rows = []
+    for hhid in full_panel['householdID'].unique():
+        couple = full_panel[full_panel['householdID'] == hhid].sort_values('wave').set_index('wave')
+        h_col_map = {'h_phys': 'h_phys_count', 'h_cesd': 'h_cesd10', 'h_multi': 'h_multi_dim'}
+        w_col_map = {'w_phys': 'w_phys_count', 'w_cesd': 'w_cesd10', 'w_multi': 'w_multi_dim'}
+        h_long = h_col_map.get(h_prefix, h_prefix)
+        w_long = w_col_map.get(w_prefix, w_prefix)
+        for t, t1 in [(1,2), (2,3), (3,4)]:
+            if t in couple.index and t1 in couple.index:
+                clpm_rows.append({
+                    'householdID': hhid,
+                    'h_t': couple.loc[t, h_long], 'w_t': couple.loc[t, w_long],
+                    'h_t1': couple.loc[t1, h_long], 'w_t1': couple.loc[t1, w_long],
+                })
+    df_clpm = pd.DataFrame(clpm_rows)
+    results_list = []
+    for outcome, preds, sub_label in [
+        ('h_t1', ['h_t', 'w_t'], f'{label}-H(t+1)'),
+        ('w_t1', ['w_t', 'h_t'], f'{label}-W(t+1)'),
+    ]:
+        d = df_clpm[['householdID', outcome] + preds].dropna()
+        if len(d) < 100: continue
+        y = d[outcome]
+        X = sm.add_constant(d[preds])
+        try:
+            gee = GEE(y, X, groups=d['householdID'], family=Gaussian(), cov_struct=Exchangeable())
+            res = gee.fit()
+            for pred in preds:
+                coef = res.params[pred]
+                se = res.bse[pred]
+                p = res.pvalues[pred]
+                ci_l, ci_h = coef - 1.96*se, coef + 1.96*se
+                is_cross = (('h' in outcome and 'w' in pred) or ('w' in outcome and 'h' in pred))
+                etype = '交叉效应(Partner)' if is_cross else '自回归(Actor)'
+                p_str = '<0.0001' if p < 0.0001 else f'{p:.4f}'
+                sig = '***' if p<0.001 else ('**' if p<0.01 else ('*' if p<0.05 else ''))
+                print(f"    [GEE回退] {pred} → {outcome} [{etype}]: β={coef:.4f}, P={p_str}{sig}")
+                results_list.append({
+                    '因变量': sub_label, '自变量': pred, '效应类型': etype,
+                    'β': f'{coef:.4f}', 'SE': f'{se:.4f}',
+                    '95%CI': f'({ci_l:.4f}, {ci_h:.4f})', 'P': p_str, '显著性': sig
+                })
+        except: pass
+    return results_list
+
+
+# 运行CLPM
+for h_pref, w_pref, label in [
+    ('h_phys', 'w_phys', '身体共病'),
+    ('h_cesd', 'w_cesd', 'CESD抑郁'),
+    ('h_multi', 'w_multi', '多维共病'),
+]:
+    res = run_sem_clpm(clpm_data, h_pref, w_pref, label)
+    clpm_results.extend(res)
 
 clpm_df = pd.DataFrame(clpm_results)
 clpm_df.to_csv(os.path.join(TAB_DIR, "table6_clpm_results.csv"), index=False, encoding='utf-8-sig')
@@ -309,7 +415,7 @@ for outcome, outcome_label in [
 
     y = data[outcome]
     X = sm.add_constant(data[predictors])
-    groups = data['householdID']
+    groups = data['person_id']  # 以个体为聚类单元，控制个体内重复测量
 
     try:
         gee = GEE(y, X, groups=groups, family=Gaussian(),
@@ -351,7 +457,7 @@ for outcome, outcome_label in [
     ('actor_adl', 'ADL障碍数'),
 ]:
     predictors = ['actor_phys_traj', 'partner_phys_traj', 'gender', 'age', 'wave']
-    data = df_apim_ind[['householdID', outcome] + predictors].dropna()
+    data = df_apim_ind[['householdID', 'person_id', outcome] + predictors].dropna()
     if len(data) < 200:
         continue
 
@@ -361,7 +467,7 @@ for outcome, outcome_label in [
 
     y = data[outcome]
     X = sm.add_constant(data[predictors + ['actor_x_partner']])
-    groups = data['householdID']
+    groups = data['person_id']  # 以个体为聚类单元
 
     try:
         gee = GEE(y, X, groups=groups, family=Gaussian(), cov_struct=Exchangeable())
@@ -424,7 +530,7 @@ for subgroup_var, subgroup_label, categories in [
     print(f"\n--- 按{subgroup_label}分层 (结局: CESD-10) ---")
     for cat_val, cat_label in categories.items():
         subset = df_apim_ind[df_apim_ind[subgroup_var] == cat_val].copy()
-        data = subset[['householdID', 'actor_cesd', 'actor_phys_count',
+        data = subset[['householdID', 'person_id', 'actor_cesd', 'actor_phys_count',
                        'partner_phys_count', 'age', 'wave']].dropna()
         if len(data) < 100:
             print(f"  {cat_label}: 样本不足 ({len(data)})")
@@ -432,7 +538,7 @@ for subgroup_var, subgroup_label, categories in [
 
         y = data['actor_cesd']
         X = sm.add_constant(data[['actor_phys_count', 'partner_phys_count', 'age', 'wave']])
-        groups = data['householdID']
+        groups = data['person_id']  # 以个体为聚类单元
 
         try:
             gee = GEE(y, X, groups=groups, family=Gaussian(), cov_struct=Exchangeable())

@@ -1,12 +1,11 @@
 """
 基于CHARLS的夫妻共病轨迹耦合及交互健康效应研究
-Phase 3 - Part 1: 共病轨迹识别 (GBTM)
-使用有限混合模型识别丈夫/妻子各自的共病发展轨迹组
+Phase 3 - Part 1: 共病轨迹识别 (LCGA)
+使用潜在类别增长分析识别丈夫/妻子各自的共病发展轨迹组
 """
 
 import pandas as pd
 import numpy as np
-from sklearn.mixture import GaussianMixture
 from scipy import stats
 import matplotlib
 matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei']
@@ -56,66 +55,151 @@ df_traj = pd.DataFrame.from_dict(traj_data, orient='index')
 print(f"轨迹矩阵: {df_traj.shape}")
 
 # ============================================================
-# 2. GBTM: 组基轨迹建模 (基于 GMM)
+# 2. LCGA: 潜在类别增长分析 (Latent Class Growth Analysis)
 # ============================================================
-def fit_gbtm(data_matrix, max_groups=6, var_name=""):
+# 时间点编码: 2011=0, 2013=2, 2015=4, 2018=7 (以年为单位的间距)
+TIME_POINTS = [0, 2, 4, 7]
+
+def fit_lcga(data_matrix, time_points=None, max_groups=6, poly_order=1, var_name=""):
     """
-    用高斯混合模型拟合纵向轨迹，选择最优组数。
+    潜在类别增长分析 (LCGA) - GBTM的标准实现。
+    每个潜在类别k拟合独立的多项式时间函数: Y_it = β_0k + β_1k * t + ε_it
+    通过EM算法估计参数。
+
     data_matrix: N x T 矩阵 (N人, T时间点)
+    time_points: 长度T的时间点向量
+    poly_order: 多项式阶数 (1=线性, 2=二次)
     """
-    # 去除含NaN的行
+    if time_points is None:
+        time_points = TIME_POINTS
     valid_mask = ~np.any(np.isnan(data_matrix), axis=1)
-    X = data_matrix[valid_mask]
-    print(f"  {var_name}: 有效样本 {X.shape[0]}/{data_matrix.shape[0]}")
+    Y = data_matrix[valid_mask]
+    N, T = Y.shape
+    t = np.array(time_points, dtype=float)
+    print(f"  {var_name}: 有效样本 {N}/{data_matrix.shape[0]}")
+
+    # 构建时间设计矩阵 (T x p)
+    if poly_order == 1:
+        X_time = np.column_stack([np.ones(T), t])
+    else:
+        X_time = np.column_stack([np.ones(T), t, t**2])
+    p = X_time.shape[1]
 
     results = {}
-    for n in range(2, max_groups + 1):
-        gmm = GaussianMixture(n_components=n, covariance_type='full',
-                               max_iter=500, n_init=20, random_state=42)
-        gmm.fit(X)
-        bic = gmm.bic(X)
-        aic = gmm.aic(X)
-        # 计算分类质量 (entropy)
-        probs = gmm.predict_proba(X)
-        entropy = -np.sum(probs * np.log(probs + 1e-10)) / X.shape[0]
-        avg_pp = np.mean(np.max(probs, axis=1))  # 平均后验概率
-        results[n] = {
-            'model': gmm, 'bic': bic, 'aic': aic,
-            'entropy': entropy, 'avg_pp': avg_pp,
-            'labels': gmm.predict(X), 'probs': probs,
-            'valid_mask': valid_mask
-        }
-        print(f"    K={n}: BIC={bic:.0f}, AIC={aic:.0f}, AvgPP={avg_pp:.3f}, Entropy={entropy:.3f}")
+    for K in range(2, max_groups + 1):
+        best_ll = -np.inf
+        best_params = None
 
-    # 选择BIC最小的模型，但不少于3组
-    best_k = min(results, key=lambda k: results[k]['bic'])
-    # 同时考虑avg_pp > 0.7的约束
+        for init_run in range(20):
+            np.random.seed(42 + init_run * 7)
+            # 初始化: K-means初始化 + OLS拟合各组参数
+            pi = np.ones(K) / K
+            labels_init = np.random.choice(K, N)
+            Beta = np.zeros((K, p))
+            sigma2 = np.ones(K)
+
+            for k in range(K):
+                mask_k = labels_init == k
+                if mask_k.sum() < 2:
+                    Beta[k] = np.random.randn(p) * 0.5
+                    sigma2[k] = 1.0
+                    continue
+                Y_bar_k = Y[mask_k].mean(axis=0)
+                Beta[k] = np.linalg.lstsq(X_time, Y_bar_k, rcond=None)[0]
+                residuals = Y[mask_k] - (X_time @ Beta[k])
+                sigma2[k] = max(residuals.var(), 0.01)
+
+            prev_ll = -np.inf
+            for em_iter in range(300):
+                # === E-step: 后验概率 ===
+                log_resp = np.zeros((N, K))
+                for k in range(K):
+                    mu_k = X_time @ Beta[k]  # T维均值向量
+                    residuals = Y - mu_k     # N x T
+                    log_resp[:, k] = (np.log(pi[k] + 1e-300)
+                                      - 0.5 * T * np.log(2 * np.pi * sigma2[k])
+                                      - 0.5 * np.sum(residuals**2, axis=1) / sigma2[k])
+
+                # 数值稳定softmax
+                log_resp_max = log_resp.max(axis=1, keepdims=True)
+                resp = np.exp(log_resp - log_resp_max)
+                resp_sum = resp.sum(axis=1, keepdims=True)
+                resp = resp / resp_sum
+
+                ll = np.sum(np.log(resp_sum.ravel()) + log_resp_max.ravel())
+
+                # === M-step: 更新参数 ===
+                N_k = resp.sum(axis=0)
+                pi = N_k / N
+
+                for k in range(K):
+                    if N_k[k] < 1:
+                        continue
+                    w = resp[:, k]
+                    # 加权均值轨迹
+                    Y_bar = (Y.T * w).sum(axis=1) / N_k[k]
+                    Beta[k] = np.linalg.lstsq(X_time, Y_bar, rcond=None)[0]
+                    residuals = Y - X_time @ Beta[k]
+                    sigma2[k] = max(np.sum(w[:, None] * residuals**2) / (N_k[k] * T), 0.001)
+
+                if em_iter > 0 and abs(ll - prev_ll) < 1e-6:
+                    break
+                prev_ll = ll
+
+            if ll > best_ll:
+                best_ll = ll
+                best_params = (pi.copy(), Beta.copy(), sigma2.copy(), resp.copy())
+
+        pi, Beta, sigma2, resp = best_params
+        labels = resp.argmax(axis=1)
+        avg_pp = np.mean(resp.max(axis=1))
+        entropy = -np.sum(resp * np.log(resp + 1e-10)) / N
+
+        # BIC & AIC
+        n_params = K * (p + 1) + (K - 1)  # Beta(K*p) + sigma2(K) + pi(K-1)
+        bic = -2 * best_ll + n_params * np.log(N)
+        aic = -2 * best_ll + 2 * n_params
+
+        results[K] = {
+            'bic': bic, 'aic': aic, 'avg_pp': avg_pp,
+            'entropy': entropy,
+            'labels': labels, 'probs': resp,
+            'Beta': Beta, 'sigma2': sigma2, 'pi': pi,
+            'valid_mask': valid_mask, 'll': best_ll
+        }
+        print(f"    K={K}: BIC={bic:.0f}, AIC={aic:.0f}, AvgPP={avg_pp:.3f}, "
+              f"Entropy={entropy:.3f}, LL={best_ll:.1f}")
+
+    # 选择最优K: BIC最小 且 AvgPP >= 0.70
     candidates = {k: v for k, v in results.items() if v['avg_pp'] >= 0.70}
     if candidates:
         best_k = min(candidates, key=lambda k: candidates[k]['bic'])
+    else:
+        best_k = min(results, key=lambda k: results[k]['bic'])
 
-    print(f"  最优组数: K={best_k} (BIC={results[best_k]['bic']:.0f}, AvgPP={results[best_k]['avg_pp']:.3f})")
+    print(f"  最优组数: K={best_k} (BIC={results[best_k]['bic']:.0f}, "
+          f"AvgPP={results[best_k]['avg_pp']:.3f})")
     return results, best_k
 
 # --- 丈夫身体共病轨迹 ---
-print("\n=== 丈夫身体共病轨迹 ===")
+print("\n=== 丈夫身体共病轨迹 (LCGA) ===")
 h_phys_matrix = df_traj[[f'h_phys_w{w}' for w in WAVES]].values
-h_results, h_best_k = fit_gbtm(h_phys_matrix, max_groups=6, var_name="丈夫身体共病")
+h_results, h_best_k = fit_lcga(h_phys_matrix, TIME_POINTS, max_groups=6, var_name="丈夫身体共病")
 
 # --- 妻子身体共病轨迹 ---
-print("\n=== 妻子身体共病轨迹 ===")
+print("\n=== 妻子身体共病轨迹 (LCGA) ===")
 w_phys_matrix = df_traj[[f'w_phys_w{w}' for w in WAVES]].values
-w_results, w_best_k = fit_gbtm(w_phys_matrix, max_groups=6, var_name="妻子身体共病")
+w_results, w_best_k = fit_lcga(w_phys_matrix, TIME_POINTS, max_groups=6, var_name="妻子身体共病")
 
 # --- 丈夫多维共病轨迹 ---
-print("\n=== 丈夫多维共病轨迹 ===")
+print("\n=== 丈夫多维共病轨迹 (LCGA) ===")
 h_multi_matrix = df_traj[[f'h_multi_w{w}' for w in WAVES]].values
-h_multi_results, h_multi_best_k = fit_gbtm(h_multi_matrix, max_groups=5, var_name="丈夫多维共病")
+h_multi_results, h_multi_best_k = fit_lcga(h_multi_matrix, TIME_POINTS, max_groups=5, var_name="丈夫多维共病")
 
 # --- 妻子多维共病轨迹 ---
-print("\n=== 妻子多维共病轨迹 ===")
+print("\n=== 妻子多维共病轨迹 (LCGA) ===")
 w_multi_matrix = df_traj[[f'w_multi_w{w}' for w in WAVES]].values
-w_multi_results, w_multi_best_k = fit_gbtm(w_multi_matrix, max_groups=5, var_name="妻子多维共病")
+w_multi_results, w_multi_best_k = fit_lcga(w_multi_matrix, TIME_POINTS, max_groups=5, var_name="妻子多维共病")
 
 # ============================================================
 # 3. 轨迹组标签赋值 & 按均值排序
@@ -125,13 +209,14 @@ def assign_trajectory_labels(results, best_k, matrix, prefix, df_traj_ref):
     res = results[best_k]
     valid_mask = res['valid_mask']
     labels = res['labels']
-    model = res['model']
+    Beta = res['Beta']
+    t = np.array(TIME_POINTS, dtype=float)
+    X_time = np.column_stack([np.ones(len(t)), t])
 
-    # 计算各组在各时间点的均值
+    # 计算各组的拟合轨迹 (基于多项式参数)
     group_means = {}
     for g in range(best_k):
-        mask_g = labels == g
-        group_means[g] = matrix[valid_mask][mask_g].mean(axis=0)
+        group_means[g] = X_time @ Beta[g]  # 拟合均值轨迹
 
     # 按总体均值排序
     overall_means = {g: m.mean() for g, m in group_means.items()}
@@ -235,7 +320,7 @@ plot_trajectories(w_multi_means, w_multi_sizes, w_multi_traj_names,
 # ============================================================
 # 5. 输出轨迹组信息
 # ============================================================
-print("\n=== 轨迹组汇总 ===")
+print("\n=== 轨迹组汇总 (LCGA) ===")
 for label, means, sizes, names in [
     ('丈夫身体共病', h_means, h_sizes, h_traj_names),
     ('妻子身体共病', w_means, w_sizes, w_traj_names),
@@ -266,4 +351,4 @@ for label, results in [('丈夫身体', h_results), ('妻子身体', w_results),
 pd.DataFrame(model_selection).to_csv(
     os.path.join(TAB_DIR, "table5_model_selection.csv"), index=False, encoding='utf-8-sig')
 
-print("\nPhase 3 Part 1 (轨迹识别) 完成!")
+print("\nPhase 3 Part 1 (LCGA轨迹识别) 完成!")
